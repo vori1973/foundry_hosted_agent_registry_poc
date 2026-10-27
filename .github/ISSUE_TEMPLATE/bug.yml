@@ -1,0 +1,48 @@
+name: Bug report
+description: Report behavior that differs from the accepted specification
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: What happened, including the complete error when applicable?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen, and which specification or contract defines it?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include relevant version, platform, configuration, and deployment details.
+    validations:
+      required: true
+  - type: input
+    id: specification
+    attributes:
+      label: Related specification or OpenSpec change
+      description: Link the accepted spec or proposed change when known.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Add logs, screenshots, traces, or a minimal reproduction without secrets.
+

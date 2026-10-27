@@ -1,0 +1,33 @@
+schema: spec-driven
+
+context: |
+  TEMPLATE: Replace this context when creating a project.
+  Document the product domain, users, architecture, technology stack,
+  repository commands, compatibility requirements, and deployment constraints.
+  GitHub issues capture problems and ownership. OpenSpec specifications are the
+  source of truth for accepted behavior. Pull requests must link both the issue
+  and the OpenSpec change.
+
+rules:
+  proposal:
+    - Include the related GitHub issue when one exists
+    - State user impact, scope, and explicit non-goals
+    - Identify compatibility, migration, security, and operational impact
+  specs:
+    - Express observable behavior with testable scenarios
+    - Cover important failure and edge cases
+  design:
+    - Document meaningful alternatives and tradeoffs
+    - Identify rollout, rollback, telemetry, and data migration needs when relevant
+  tasks:
+    - Keep tasks ordered, independently verifiable, and small enough to review
+    - Include tests, documentation, and operational work required by the change
+
+operations:
+  apply:
+    guidance:
+      - Keep tasks.md aligned with actual implementation progress
+      - Validate the acceptance scenarios and report commands actually run
+  archive:
+    guidance:
+      - Archive only after the implementation and resulting specifications are accepted

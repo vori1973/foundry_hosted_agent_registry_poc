@@ -1,0 +1,56 @@
+name: Feature or behavior change
+description: Propose a user-visible capability or behavior change
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem before prescribing an implementation. An OpenSpec
+        change can be created after the issue is understood and accepted.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Who is affected, what are they trying to do, and what prevents it?
+      placeholder: As a ..., I need ..., because ...
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior and success criteria.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      description: State what should and should not be included.
+    validations:
+      required: true
+  - type: textarea
+    id: scenarios
+    attributes:
+      label: Acceptance scenarios
+      description: Include important normal, edge, and failure scenarios.
+      placeholder: |
+        Given ...
+        When ...
+        Then ...
+    validations:
+      required: true
+  - type: input
+    id: openspec
+    attributes:
+      label: OpenSpec change
+      description: Add the change ID or link after a proposal is created.
+      placeholder: 123-short-description
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add supporting links, screenshots, constraints, or prior decisions.
+
