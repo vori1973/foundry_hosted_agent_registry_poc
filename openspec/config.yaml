@@ -1,12 +1,24 @@
 schema: spec-driven
 
 context: |
-  TEMPLATE: Replace this context when creating a project.
-  Document the product domain, users, architecture, technology stack,
-  repository commands, compatibility requirements, and deployment constraints.
-  GitHub issues capture problems and ownership. OpenSpec specifications are the
-  source of truth for accepted behavior. Pull requests must link both the issue
-  and the OpenSpec change.
+  This POC compares one model-backed Responses 2.0.0 agent deployed from ZIP,
+  ACR, and directly from JFrog for developers and platform operators.
+  APIM/MCP are excluded. Target Python 3.13 and Linux x86_64.
+  agent/ owns runtime behavior; scripts/ owns packaging and operations;
+  deploy/ owns azd configuration. Do not depend on another local checkout.
+  Use approved Azure identity for model access and managed identity/OIDC for
+  JFrog pulls. Keep publisher and runtime permissions separate. Never embed
+  secrets or weaken TLS/network policy. Cloud targets and mutations require
+  explicit operator approval. Reuse an existing project and model deployment.
+  Require matching ZIP and local-container smoke evidence before ACR, then
+  successful ACR evidence before JFrog. Compare immutable image content.
+  Setup: python -m pip install -r requirements-dev.txt in a Python 3.13 venv.
+  Tests: python -m unittest discover -s tests -p 'test_*.py'.
+  Compile: python -m compileall -q agent scripts tests.
+  OpenSpec: npx --yes @fission-ai/openspec@1.7.0 validate --all --strict --no-interactive.
+  AGENTS.md defines review boundaries; README documents operational commands.
+  GitHub issues define problems/ownership; accepted specs define behavior.
+  Link issues and changes in PRs; never mark unavailable live checks passed.
 
 rules:
   proposal:
