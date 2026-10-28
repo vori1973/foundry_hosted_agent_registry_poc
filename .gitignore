@@ -9,4 +9,13 @@ node_modules/
 dist/
 build/
 coverage/
-
+.venv/
+.azure/
+.artifacts/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+pip-wheel-metadata/
+*.egg-info/
+docker-config/

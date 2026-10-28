@@ -1,0 +1,4 @@
+-r agent/requirements.in
+azure-ai-projects>=2.8,<2.9
+PyYAML>=6,<7
+httpx>=0.28,<0.29
