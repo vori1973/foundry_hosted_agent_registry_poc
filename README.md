@@ -106,6 +106,34 @@ live deployment success.
 operational helpers. `deploy/` contains separate azd registry configurations.
 No component depends on the external Echo MCP reference checkout.
 
+### Deployment method comparison
+
+| Aspect | ZIP | ACR | JFrog |
+| --- | --- | --- | --- |
+| Deployment input | Source ZIP with bundled pinned Python dependencies | Verified prebuilt container image | The same verified prebuilt container image |
+| Immutable artifact identity | ZIP SHA-256 | Registry image digest | Registry image digest; config/layers compared with ACR for this POC |
+| Artifact delivery | Deployer uploads the ZIP to Foundry | Foundry acquires the image from ACR | Foundry acquires the image directly from JFrog; no ACR relay |
+| Runtime registry authentication | No customer registry pull credentials required | Azure-native Entra/managed identity | Project managed identity token exchanged for short-lived JFrog credentials |
+| Registry pull authorization | Not applicable to the uploaded ZIP | Azure RBAC/ABAC appropriate to the registry mode | JFrog OIDC identity mapping, group and repository read-only permissions |
+| Registry connection | No registry connection for this path | azd helper checks an existing secretless AAD ACR connection | Explicit same-project OAuth token-exchange connection on the agent container configuration |
+| Repository deployment entry points | `scripts/deploy.py --method zip` | `scripts/deploy.py --method acr` or `scripts/deploy_azd.sh --method acr` | `scripts/deploy.py --method jfrog` or `scripts/deploy_azd.sh --method jfrog` |
+| Update an existing agent | Create a new version under the existing agent name using the new ZIP | Create a new version under the existing agent name using the new image digest | Create a new version under the existing agent name using the new image digest and registry connection |
+
+All three run the same model-backed Responses workload and use a separate
+approved runtime identity for model access. None updates a deployed version
+in place or automatically adopts a newly published artifact. An operator or
+CI/CD system must deploy a new version and explicitly control which version
+the stable endpoint serves; pin production routing rather than relying on
+Foundry's default "Always use latest" policy.
+
+The update row describes Foundry's versioning model, not an unrestricted
+existing-agent capability in every helper: the SDK helper checks POC ownership,
+while the azd comparison helper requires a fresh agent name. See
+[updating an existing agent](#updating-an-existing-agent-from-an-approved-jfrog-artifact)
+for executable commands, routing cautions and CI/CD-neutral rollout guidance.
+
+### POC validation sequence
+
 The required progression is:
 
 ```text
@@ -116,6 +144,8 @@ New ZIP active + Responses smoke
 ```
 
 Both ACR and JFrog must be exercised through azd and the Python SDK.
+This ordering is a POC comparison gate, not a Foundry requirement: a customer
+can deploy directly from JFrog without first deploying from ACR.
 JFrog runtime pulls use project managed identity/OIDC and a same-project
 registry connection, not publisher credentials or an ACR relay.
 Generated local artifacts and sanitized run evidence belong under ignored
@@ -737,6 +767,140 @@ resume again. Failed provisioning cannot pass smoke. Do not rerun creation
 automatically after timeout: a new deployment command may create a new version.
 There is no automatic deletion/rollback; retain evidence and confirm POC
 ownership before any separate cleanup.
+
+## Updating an existing agent from an approved JFrog artifact
+
+Foundry agent versions are immutable. Updating the container image, runtime
+configuration or model settings means **creating a new version under the
+existing agent name**, not editing an already-deployed version. The logical
+agent and its stable endpoint can remain the same. Changing the endpoint's
+version selector is a separate operation that selects which version is served.
+
+Pushing or promoting an image in JFrog does not update an existing Foundry
+version. An operator or deployment pipeline must submit the new image digest
+and registry connection. Foundry then handles image acquisition using the
+project managed identity and JFrog OIDC exchange. There is no separate pull
+button, and caching means activation does not prove a fresh layer download.
+Do not use a mutable tag such as `latest` as the deployment identity.
+
+### Manual update using the repository SDK helper
+
+For an explicitly approved update to an **existing POC-owned test agent**,
+set `JFROG_IMAGE` to the newly approved digest-qualified reference. Retain the
+same project, agent name and compatible existing registry connection, and
+supply evidence for the selected build:
+
+```bash
+UPDATE_AGENT="<existing-POC-owned-test-agent>"
+python scripts/deploy.py --method jfrog --name "$UPDATE_AGENT" --image "$JFROG_IMAGE" \
+  --zip-evidence "$ZIP_EVIDENCE" --local-evidence "$LOCAL_EVIDENCE" \
+  --publication-evidence "$JFROG_PUBLICATION_EVIDENCE" \
+  --acr-publication-evidence "$PUBLICATION_EVIDENCE" \
+  --acr-sdk-evidence "$ACR_SDK_EVIDENCE" --acr-azd-evidence "$ACR_AZD_EVIDENCE" \
+  --approve-cloud
+```
+
+Omitting `--version` creates a new version; capture its actual ID from the
+result instead of assuming it is the previous ID plus one. The SDK helper
+permits an existing name only when its latest version carries this POC's
+ownership metadata. It refuses to adopt an unrelated customer agent. General
+customer update automation should use the supported SDK/API with the customer's
+own ownership and approval controls.
+
+The POC still requires matching ZIP/local smoke, ACR publication and both ACR
+model-smoke baselines for this build. A source/dependency/shared-configuration
+change invalidates earlier baselines; regenerate the affected evidence rather
+than reusing results from the previous artifact. Reuse the registry connection
+only if its project, target, audience, provider and repository permissions
+remain correct; changes to trust or access need separate approval.
+
+**Routing caution:** the current SDK helper waits for activation, switches the
+selected agent endpoint to 100% of the new version, and then runs its smoke.
+It is a POC deployment command, not a production validate-before-promotion
+pipeline. The azd helper deliberately requires a fresh agent name for isolated
+comparison runs; it is not an existing-agent update wrapper. `--version`
+on the SDK helper only resumes verification: it neither updates the image nor
+changes routing.
+
+### CI/CD-neutral release and rollout design
+
+Customers can implement the same contract with **GitHub Actions, Azure DevOps
+Pipelines, GitLab CI/CD, Jenkins, or another approved orchestrator**. GitHub is
+an example, not a requirement. The deployment boundary is a supported Foundry
+SDK/API call or an azd deployment of the approved prebuilt image, not a
+particular source-control or CI/CD product.
+
+```text
+Build once -> Test/scan -> Push to JFrog -> Approve exact artifact digest
+    -> Authenticated release trigger or manual pipeline run
+    -> Validate isolated candidate -> Approve production promotion
+    -> Create new production agent version -> Wait for Active
+    -> Select version on stable endpoint -> Smoke -> Retain rollback target
+```
+
+An organization may scan after upload or promote into a release repository;
+in either case, verify approval and policy results against the final selected
+digest before deployment. Ensure the runtime mapping has read-only access to
+that exact release repository; do not broaden permissions automatically.
+
+1. **Trigger:** start from an approved release/promotion, not every artifact
+   upload. Use an authenticated JFrog event integration supported by the
+   customer's installation, or a manual release run initially. Where needed,
+   an authenticated bridge translates the event into the orchestrator's
+   trigger API. Treat the event as a notification: recheck the approval,
+   allowlisted registry/repository and digest against trusted release records.
+2. **Inputs:** carry the immutable image reference, source/build identity,
+   approval reference, project, logical agent name, registry connection and
+   runtime configuration. Preserve required test/publication evidence in
+   controlled pipeline artifacts, not just workstation `.artifacts` files.
+3. **Identity:** keep publisher-to-JFrog, pipeline-to-Azure and Foundry-to-JFrog
+   identities separate. Prefer workload federation/OIDC or an approved runner
+   managed identity for Azure deployment. The existing audience-only Entra
+   application is not the pipeline deployment identity. Never pass the
+   publisher token to Foundry or store permanent registry pull credentials.
+4. **Validate and deploy:** test an isolated candidate using the approved
+   image/configuration. Before creating a production version, explicitly pin
+   its stable endpoint to the current known-good version; Foundry's default
+   "Always use latest" can otherwise advance traffic when a version is created.
+   Record the old version/selector, create the new version under the existing
+   production agent name and wait with a finite timeout. Do not rebuild,
+   silently create shared resources, copy to ACR or change routing on failure.
+5. **Promote:** after candidate validation and production-version activation,
+   require the customer's environment/release approval before changing the
+   production endpoint selector. Read back the selected version, run one
+   approved exact-version model smoke and retain the result. Candidate testing
+   does not replace the production post-promotion smoke. This staged routing
+   controller is a customer pipeline responsibility, not implemented by the
+   current POC helper.
+6. **Recover and audit:** serialize releases per project/agent and correlate
+   duplicate events with the existing run/version before submitting again.
+   A repeated creation command can create another immutable version. Retain
+   digest, approval, created version, routing changes, timing and sanitized
+   outcome; never save tokens or raw authentication responses.
+
+For rollback, an authorized operator selects the retained known-good version
+on the same agent endpoint instead of repushing an old image or editing a
+version. In Foundry, open the agent's **Publish** dropdown and version selector;
+choose the known-good version and confirm the endpoint routing. SDK automation
+can use `agents.update_details` with an explicit `VersionSelector` and
+`FixedRatioVersionSelectionRule`. Read back the binding and verify recovery;
+retain the failed version for diagnosis. Existing sessions can remain bound
+to their original version, so changing the selector is not a guarantee of
+migrating every in-flight session. Do not delete shared projects or registries.
+
+For example, GitHub Actions can use environment approvals, Azure DevOps can
+use environment approvals/checks, GitLab can use protected environments and
+deployment approvals where available, and Jenkins can use a controlled approval
+stage. Configure equivalent controls for the customer's platform and license.
+These are design options, not claims that live CD or production rollback is
+already configured in this repository. Cleanup and full operational acceptance
+remain tracked by the open OpenSpec tasks.
+
+References:
+[manage hosted agents and create versions](https://learn.microsoft.com/azure/foundry/agents/how-to/manage-hosted-agent),
+[select the active version](https://learn.microsoft.com/azure/foundry/agents/how-to/configure-agent),
+[direct private-registry deployment](https://learn.microsoft.com/azure/foundry/agents/how-to/private-registry-connections),
+and [Microsoft's GitHub Actions example](https://learn.microsoft.com/azure/foundry/agents/quickstarts/set-up-cicd-hosted-agent).
 
 ## Development
 
