@@ -153,7 +153,10 @@ class LocalSmokeTests(unittest.TestCase):
                 raise subprocess.CalledProcessError(1, command, stderr="synthetic-secret")
             return docker(command, **kwargs)
 
-        with self.assertRaisesRegex(RuntimeError, "exited before readiness"):
+        with (
+            patch.object(local_smoke.time, "monotonic", return_value=0),
+            self.assertRaisesRegex(RuntimeError, "exited before readiness"),
+        ):
             local_smoke.run_local(
                 self.config, self.build, AccessToken("synthetic-secret", time.time() + 600), record, fail,
             )
