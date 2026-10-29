@@ -34,15 +34,21 @@ except ImportError:
     )
 
 
-def deployment_definition(config):
+def deployment_definition(config, *, qualification=False, pull_only=False):
     config.validate()
+    if pull_only is not False and (
+        pull_only is not True or config.method != "gar" or qualification is not True
+    ):
+        raise VerificationBlocked("Legacy startup labels are restricted to explicit GAR pull-only diagnostics.")
+    if config.method == "gar" and qualification is not True:
+        raise VerificationBlocked("GAR definitions are available only to the isolated qualification probe.")
     source = {
         "code_configuration": CodeConfiguration(
             runtime="python_3_13", entry_point=["python", "main.py"], dependency_resolution="bundled",
         )
     } if config.method == "zip" else {"container_configuration": ContainerConfiguration(
         image=config.image,
-        **({"registry_connection_id": config.registry_connection} if config.method == "jfrog" else {}),
+        **({"registry_connection_id": config.registry_connection} if config.method in {"jfrog", "gar"} else {}),
     )}
     return HostedAgentDefinition(
         cpu=config.cpu,
@@ -51,17 +57,19 @@ def deployment_definition(config):
         protocol_versions=[ProtocolVersionRecord(protocol="responses", version="2.0.0")],
         environment_variables={
             "AZURE_AI_MODEL_DEPLOYMENT_NAME": config.model,
-            "DEPLOYMENT_SOURCE": config.method,
+            "DEPLOYMENT_SOURCE": "acr" if pull_only else config.method,
             "PYTHONNOUSERSITE": "1",
         },
     )
 
 
-def verify_ownership(project, config):
+def verify_ownership(project, config, *, require_fresh=False):
     try:
         existing = project.agents.get(agent_name=config.name)
     except ResourceNotFoundError:
         return
+    if require_fresh:
+        raise VerificationBlocked("Qualification requires an unused isolated agent name; retain existing versions.")
     latest = field(field(existing, "versions", {}), "latest", {})
     metadata = field(latest, "metadata", {}) or {}
     if metadata.get("poc_change") != CHANGE:
@@ -141,9 +149,9 @@ def registry_evidence(config, args, record):
     return records
 
 
-def validate_container_state(state, config):
+def validate_container_state(state, config, *, qualification=False, pull_only=False):
     definition = field(state, "definition", {})
-    desired = deployment_definition(config).as_dict()
+    desired = deployment_definition(config, qualification=qualification, pull_only=pull_only).as_dict()
     actual = definition.as_dict() if hasattr(definition, "as_dict") else definition
     if any(actual.get(key) != value for key, value in desired.items()) or actual.get("code_configuration"):
         raise VerificationBlocked("The deployed container definition differs from the selected workload/image.")

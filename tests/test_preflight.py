@@ -5,7 +5,7 @@ from dataclasses import replace
 from unittest.mock import Mock, patch
 
 from scripts.preflight import (
-    Configuration, InputError, check_jfrog_connection, jfrog_settings,
+    Configuration, InputError, check_gar_connection, check_jfrog_connection, gar_settings, jfrog_settings,
     positive_timeout, tool_versions,
 )
 
@@ -27,6 +27,20 @@ JFROG_ENV = {
     "JFROG_OIDC_PROVIDER_NAME": "foundrypoc",
     "JFROG_TOKEN_ENDPOINT": "/access/api/v1/oidc/token",
 }
+GAR_ENV = {
+    **ENV,
+    "REGISTRY_CONNECTION_NAME": "gar-qualification",
+    "GAR_REGISTRY_ORIGIN": "https://us-east1-docker.pkg.dev",
+    "GAR_PROJECT_ID": "artifact-project",
+    "GAR_LOCATION": "us-east1",
+    "GAR_REPOSITORY": "poc-images",
+    "GAR_ENTRA_AUDIENCE": "11111111-1111-1111-1111-111111111111",
+    "GAR_WORKLOAD_IDENTITY_PROVIDER": (
+        "//iam.googleapis.com/projects/123456789/locations/global/"
+        "workloadIdentityPools/azure-pool/providers/azure-provider"
+    ),
+}
+GAR_IMAGE = "us-east1-docker.pkg.dev/artifact-project/poc-images/agent@sha256:" + "a" * 64
 
 
 class PreflightTests(unittest.TestCase):
@@ -123,6 +137,96 @@ class PreflightTests(unittest.TestCase):
                 jfrog_settings({**JFROG_ENV, "JFROG_REGISTRY_ORIGIN": origin})
         with self.assertRaises(InputError):
             jfrog_settings({**JFROG_ENV, "JFROG_TOKEN_ENDPOINT": "https://other.example.com/token"})
+
+    def test_gar_requires_explicit_qualification_mode_and_same_project_connection(self):
+        with self.assertRaises(InputError):
+            Configuration.from_env("gar", "agent", GAR_IMAGE, env=GAR_ENV)
+        config = Configuration.from_env("gar", "agent", GAR_IMAGE, env=GAR_ENV, qualification=True)
+        self.assertTrue(config.qualification)
+        for changes in ({"qualification": False}, {"registry_connection": None}, {"image": GAR_IMAGE.split("@")[0]}):
+            with self.subTest(changes=changes), self.assertRaises(InputError):
+                replace(config, **changes).validate()
+        with self.assertRaises(InputError):
+            Configuration.from_env("zip", "agent", env=ENV, qualification=True)
+
+    def test_gar_connection_keeps_audiences_distinct_and_rejects_conflicting_keys(self):
+        config = Configuration.from_env("gar", "agent", GAR_IMAGE, env=GAR_ENV, qualification=True)
+        settings = gar_settings(GAR_ENV)
+        connection = {
+            "id": config.project_id + "/connections/" + config.registry_connection,
+            "name": config.registry_connection, "type": "CustomKeys",
+            "target": settings["origin"],
+            "metadata": {"type": "registry_connection", "mode": "oauth_token_exchange"},
+            "credentials": dict(settings["keys"]),
+        }
+        project = Mock()
+        project.connections.get.return_value = connection
+        result = check_gar_connection(config, GAR_ENV, project)
+        self.assertTrue(result["qualification_only"])
+        self.assertEqual(project.connections.get.call_args.kwargs, {"include_credentials": True})
+        self.assertEqual(settings["keys"]["audience"], GAR_ENV["GAR_ENTRA_AUDIENCE"])
+        self.assertEqual(settings["keys"]["body.audience"], GAR_ENV["GAR_WORKLOAD_IDENTITY_PROVIDER"])
+        for field, value in (
+            ("id", "/different/project/connections/gar-qualification"),
+            ("target", settings["origin"] + "/path"), ("name", "other"),
+            ("type", "ApiKey"), ("metadata", {"type": "registry_connection", "mode": "other"}),
+        ):
+            project.reset_mock()
+            project.connections.get.return_value = {**connection, field: value}
+            with self.subTest(field=field), self.assertRaises(InputError):
+                check_gar_connection(config, GAR_ENV, project)
+            self.assertEqual(project.connections.get.call_count, 1)
+        for changes in (
+            {"audience": settings["provider"]},
+            {"body.audience": settings["audience"]},
+            {"body.grant_type": "urn:ietf:params:oauth:grant-type:token-exchange"},
+            {"body.subject_token_type": "urn:ietf:params:oauth:token-type:jwt"},
+            {"tokenendpoint": "https://other.example.com/token"},
+            {"body.subject_token": "synthetic-secret"},
+            {"headers.Authorization": "synthetic-secret"},
+            {"AUDIENCE": "synthetic-secret"},
+        ):
+            altered = copy.deepcopy(connection)
+            altered["credentials"].update(changes)
+            project.connections.get.return_value = altered
+            with self.subTest(keys=list(changes)), self.assertRaises(InputError) as caught:
+                check_gar_connection(config, GAR_ENV, project)
+            self.assertNotIn("synthetic-secret", str(caught.exception))
+        altered = copy.deepcopy(connection)
+        del altered["credentials"]["body.scope"]
+        project.connections.get.return_value = altered
+        with self.assertRaises(InputError):
+            check_gar_connection(config, GAR_ENV, project)
+        project.connections.get.side_effect = RuntimeError("synthetic-secret")
+        with self.assertRaises(InputError) as caught:
+            check_gar_connection(config, GAR_ENV, project)
+        self.assertNotIn("synthetic-secret", str(caught.exception))
+
+    def test_gar_rejects_wrong_repository_and_invalid_provider_before_connection_read(self):
+        config = Configuration.from_env("gar", "agent", GAR_IMAGE, env=GAR_ENV, qualification=True)
+        for image in (
+            GAR_IMAGE.replace("us-east1", "us-west1"),
+            GAR_IMAGE.replace("artifact-project", "other-project"),
+            GAR_IMAGE.replace("poc-images/", "other-repo/"),
+            GAR_IMAGE.replace("/agent@", "/../agent@"),
+        ):
+            project = Mock()
+            with self.subTest(image=image), self.assertRaises(InputError):
+                check_gar_connection(replace(config, image=image), GAR_ENV, project)
+            project.connections.get.assert_not_called()
+        for key in GAR_ENV.keys() - ENV.keys() - {"REGISTRY_CONNECTION_NAME"}:
+            with self.subTest(key=key), self.assertRaises(InputError):
+                gar_settings({**GAR_ENV, key: ""})
+        for key, value in (
+            ("GAR_PROJECT_ID", "123456789"),
+            ("GAR_WORKLOAD_IDENTITY_PROVIDER", GAR_ENV["GAR_WORKLOAD_IDENTITY_PROVIDER"].replace("123456789", "artifact-project")),
+            ("GAR_REGISTRY_ORIGIN", "http://us-east1-docker.pkg.dev"),
+            ("GAR_REGISTRY_ORIGIN", "https://us-east1-docker.pkg.dev:443"),
+            ("GAR_REGISTRY_ORIGIN", "https://us-east1-docker.pkg.dev?key=synthetic-secret"),
+            ("GAR_WORKLOAD_IDENTITY_PROVIDER", GAR_ENV["GAR_WORKLOAD_IDENTITY_PROVIDER"].replace("azure-pool", "gcp-pool")),
+        ):
+            with self.subTest(key=key), self.assertRaises(InputError):
+                gar_settings({**GAR_ENV, key: value})
 
     @patch("scripts.preflight.sys.version_info", (3, 13, 0))
     def test_tool_versions_and_failures(self):

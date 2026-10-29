@@ -19,7 +19,7 @@ from azure.core.exceptions import ResourceNotFoundError
 from scripts import deploy
 from scripts.preflight import Configuration, InputError
 from scripts.verify import VerificationBlocked, baseline_fingerprint, new_record
-from test_preflight import ENV, IMAGE, JFROG_ENV
+from test_preflight import ENV, GAR_ENV, GAR_IMAGE, IMAGE, JFROG_ENV
 from test_verification import state
 
 
@@ -31,7 +31,26 @@ class Credential:
 class DeploymentTests(unittest.TestCase):
     def test_real_sdk_jfrog_wire_places_connection_inside_container_configuration(self):
         config = Configuration.from_env("jfrog", "agent", IMAGE, env=JFROG_ENV)
-        definition = deploy.deployment_definition(config)
+        self.assert_registry_wire(config)
+
+    def test_real_sdk_gar_wire_is_explicitly_experimental_and_uses_native_connection(self):
+        config = Configuration.from_env("gar", "agent", GAR_IMAGE, env=GAR_ENV, qualification=True)
+        with self.assertRaises(VerificationBlocked):
+            deploy.deployment_definition(config)
+        self.assert_registry_wire(config, qualification=True)
+
+    def test_real_sdk_pull_only_wire_preserves_legacy_startup_but_targets_gar(self):
+        config = Configuration.from_env("gar", "agent", GAR_IMAGE, env=GAR_ENV, qualification=True)
+        self.assert_registry_wire(config, qualification=True, pull_only=True)
+        with self.assertRaises(VerificationBlocked):
+            deploy.deployment_definition(config, pull_only=True)
+        with self.assertRaises(VerificationBlocked):
+            deploy.deployment_definition(
+                Configuration.from_env("acr", "agent", IMAGE, env=ENV), qualification=True, pull_only=True,
+            )
+
+    def assert_registry_wire(self, config, *, qualification=False, pull_only=False):
+        definition = deploy.deployment_definition(config, qualification=qualification, pull_only=pull_only)
         captured = []
 
         def request(method, url, **kwargs):
@@ -58,18 +77,19 @@ class DeploymentTests(unittest.TestCase):
                 created = project.agents.create_version(agent_name=config.name, definition=definition)
         body = json.loads(captured[0].body)["definition"]
         self.assertEqual(body["container_configuration"], {
-            "image": IMAGE, "registry_connection_id": config.registry_connection,
+            "image": config.image, "registry_connection_id": config.registry_connection,
         })
         self.assertNotIn("code_configuration", body)
         self.assertNotIn("registry_connection_id", body)
         self.assertEqual(body["environment_variables"], {
-            "AZURE_AI_MODEL_DEPLOYMENT_NAME": config.model, "DEPLOYMENT_SOURCE": "jfrog",
+            "AZURE_AI_MODEL_DEPLOYMENT_NAME": config.model,
+            "DEPLOYMENT_SOURCE": "acr" if pull_only else config.method,
             "PYTHONNOUSERSITE": "1",
         })
-        deploy.validate_container_state(created, config)
+        deploy.validate_container_state(created, config, qualification=qualification, pull_only=pull_only)
         created.definition.container_configuration.registry_connection_id = "other-connection"
         with self.assertRaises(VerificationBlocked):
-            deploy.validate_container_state(created, config)
+            deploy.validate_container_state(created, config, qualification=qualification, pull_only=pull_only)
 
     def test_jfrog_connection_conflict_blocks_before_agent_creation(self):
         config = Configuration.from_env("jfrog", "agent", IMAGE, env=JFROG_ENV)

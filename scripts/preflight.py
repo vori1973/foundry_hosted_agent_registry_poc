@@ -71,10 +71,15 @@ class Configuration:
     timeout: float = 600
     cpu: str = "0.5"
     memory: str = "1Gi"
+    qualification: bool = False
 
     def validate(self):
-        if self.method not in {"zip", "acr", "jfrog"}:
-            raise InputError("method", "Method must be zip, acr, or jfrog.")
+        if self.method not in {"zip", "acr", "jfrog", "gar"}:
+            raise InputError("method", "Method must be zip, acr, jfrog, or qualification-only gar.")
+        if self.qualification is not False and self.method != "gar":
+            raise InputError("qualification", "Qualification mode is only available for GAR.")
+        if self.method == "gar" and self.qualification is not True:
+            raise InputError("qualification", "GAR is unqualified; explicit qualification mode is required.")
         if not NAME.fullmatch(self.name):
             raise InputError("name", "Agent name must be 1-63 alphanumeric/hyphen characters.")
         project_endpoint(self.endpoint)
@@ -104,10 +109,14 @@ class Configuration:
                 r"[A-Za-z0-9_-]+", self.registry_connection
             ):
                 raise InputError("REGISTRY_CONNECTION_NAME", "JFrog requires a same-project registry connection name.")
+        if self.method == "gar" and (
+            not self.registry_connection or not re.fullmatch(r"[A-Za-z0-9_-]+", self.registry_connection)
+        ):
+            raise InputError("REGISTRY_CONNECTION_NAME", "GAR qualification requires a same-project connection name.")
         return self
 
     @classmethod
-    def from_env(cls, method, name, image=None, timeout=600, env=None):
+    def from_env(cls, method, name, image=None, timeout=600, env=None, *, qualification=False):
         env = os.environ if env is None else env
         return cls(
             method=method,
@@ -117,9 +126,10 @@ class Configuration:
             model=env.get("AZURE_AI_MODEL_DEPLOYMENT_NAME", ""),
             image=image,
             registry_connection=(
-                env.get("REGISTRY_CONNECTION_NAME") if method == "jfrog" else None
+                env.get("REGISTRY_CONNECTION_NAME") if method in {"jfrog", "gar"} else None
             ),
             timeout=positive_timeout(timeout),
+            qualification=qualification,
         ).validate()
 
 
@@ -238,9 +248,114 @@ def check_jfrog_connection(config, env=None, project=None):
     return {"registry_connection": config.registry_connection, "connection_preflight": "passed"}
 
 
+def gar_settings(env=None):
+    env = os.environ if env is None else env
+    fields = {
+        "GAR_PROJECT_ID": r"[a-z][a-z0-9-]{4,28}[a-z0-9]",
+        "GAR_LOCATION": r"[a-z]+(?:-[a-z]+)*[0-9]*",
+        "GAR_REPOSITORY": r"[a-z][a-z0-9_-]{0,62}",
+        "GAR_ENTRA_AUDIENCE": r"[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}",
+        "GAR_WORKLOAD_IDENTITY_PROVIDER": (
+            r"//iam\.googleapis\.com/projects/[1-9][0-9]*/locations/global/"
+            r"workloadIdentityPools/[a-z0-9-]{4,32}/providers/[a-z0-9-]{4,32}"
+        ),
+    }
+    values = {}
+    for key, pattern in fields.items():
+        value = env.get(key, "")
+        if not isinstance(value, str) or not re.fullmatch(pattern, value):
+            raise InputError(key, "Set the exact approved GAR qualification input.")
+        values[key] = value
+    provider = values["GAR_WORKLOAD_IDENTITY_PROVIDER"]
+    if any(part.startswith("gcp-") for part in (provider.split("/")[-3], provider.split("/")[-1])):
+        raise InputError("GAR_WORKLOAD_IDENTITY_PROVIDER", "Google reserves the gcp- pool/provider prefix.")
+    origin = env.get("GAR_REGISTRY_ORIGIN", "")
+    if origin != f"https://{values['GAR_LOCATION']}-docker.pkg.dev":
+        raise InputError("GAR_REGISTRY_ORIGIN", "Use the exact HTTPS GAR origin for the selected location.")
+    return {
+        "origin": origin,
+        "project_id": values["GAR_PROJECT_ID"],
+        "location": values["GAR_LOCATION"],
+        "repository": values["GAR_REPOSITORY"],
+        "audience": values["GAR_ENTRA_AUDIENCE"],
+        "provider": provider,
+        "token_endpoint": "https://sts.googleapis.com/v1/token",
+        "keys": {
+            "type": "CustomKeys",
+            "audience": values["GAR_ENTRA_AUDIENCE"],
+            "tokenendpoint": "https://sts.googleapis.com/v1/token",
+            "body.audience": provider,
+            "body.requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "body.scope": "https://www.googleapis.com/auth/cloud-platform",
+        },
+    }
+
+
+def validate_gar_target(config, settings):
+    config.validate()
+    if config.method != "gar":
+        raise InputError("method", "GAR checks require qualification-only GAR configuration.")
+    prefix = f"{urlsplit(settings['origin']).netloc}/{settings['project_id']}/{settings['repository']}/"
+    if (
+        not config.image.startswith(prefix)
+        or any(part in {"", ".", ".."} for part in config.image.split("@", 1)[0].split("/"))
+    ):
+        raise InputError("image", "The immutable image must select the approved GAR project and repository.")
+
+
+def validate_gar_connection(config, connection, settings, *, credentials=False):
+    validate_gar_target(config, settings)
+    expected_id = config.project_id + "/connections/" + config.registry_connection
+    metadata = connection.get("metadata") or {}
+    if (
+        connection.get("id", "").lower() != expected_id.lower()
+        or connection.get("name") != config.registry_connection
+        or connection.get("type") != "CustomKeys"
+        or connection.get("target") != settings["origin"]
+        or metadata.get("type") != "registry_connection"
+        or metadata.get("mode") != "oauth_token_exchange"
+    ):
+        raise InputError("registry_connection", "The GAR connection must match the selected project, origin and mode.")
+    if credentials:
+        values = connection.get("credentials") or {}
+        values = values.as_dict() if hasattr(values, "as_dict") else values
+        if not isinstance(values, dict) or any(not isinstance(key, str) for key in values):
+            raise InputError("registry_connection", "The GAR candidate requires exact nonsecret custom keys.")
+        normalized = {key.lower(): value for key, value in values.items()}
+        if len(normalized) != len(values) or normalized != settings["keys"]:
+            raise InputError("registry_connection", "The GAR experimental candidate differs; do not overwrite it.")
+
+
+def check_gar_connection(config, env=None, project=None):
+    settings = gar_settings(env)
+    validate_gar_target(config, settings)
+    if project is None:
+        from azure.ai.projects import AIProjectClient
+        from azure.identity import DefaultAzureCredential
+        with DefaultAzureCredential() as credential, AIProjectClient(
+            endpoint=config.endpoint, credential=credential, allow_preview=True,
+            retry_total=0, connection_timeout=10, read_timeout=30,
+        ) as client:
+            return check_gar_connection(config, env, client)
+    try:
+        connection = project.connections.get(config.registry_connection)
+        validate_gar_connection(config, connection, settings)
+        connection = project.connections.get(config.registry_connection, include_credentials=True)
+        validate_gar_connection(config, connection, settings, credentials=True)
+    except InputError:
+        raise
+    except Exception:
+        raise InputError("registry_connection", "The GAR connection could not be read; check selection and access.") from None
+    return {
+        "registry_connection": config.registry_connection, "connection_preflight": "passed",
+        "qualification_only": True,
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Validate POC inputs without creating cloud resources.")
-    parser.add_argument("--method", choices=["zip", "acr", "jfrog"], required=True)
+    parser.add_argument("--method", choices=["zip", "acr", "jfrog", "gar"], required=True)
+    parser.add_argument("--qualification", action="store_true", help="Validate the unqualified GAR candidate only.")
     parser.add_argument("--name", required=True)
     parser.add_argument("--image")
     parser.add_argument("--timeout", type=positive_timeout, default=600)
@@ -250,15 +365,22 @@ def main(argv=None):
     parser.add_argument("--local-evidence", type=Path)
     args = parser.parse_args(argv)
     try:
-        config = Configuration.from_env(args.method, args.name, args.image, args.timeout)
+        config = Configuration.from_env(
+            args.method, args.name, args.image, args.timeout, qualification=args.qualification,
+        )
         if args.method != "zip":
             check_baselines(config, args.zip_evidence, args.local_evidence)
         if args.method == "jfrog":
             check_jfrog_connection(config)
+        if args.method == "gar":
+            check_gar_connection(config)
         versions = tool_versions(args.entry_point, args.method != "zip") if args.check_tools else {}
     except ValueError as error:
         parser.exit(1, f"Preflight failed: {error}\n")
-    print(json.dumps({"status": "inputs_valid", "method": config.method, "tools": versions}))
+    output = {"status": "inputs_valid", "method": config.method, "tools": versions}
+    if config.method == "gar":
+        output["qualification_only"] = True
+    print(json.dumps(output))
     print("Cloud region/capacity, permissions, model access and network approval still require operator checks.")
 
 
